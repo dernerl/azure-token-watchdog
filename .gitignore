@@ -1,0 +1,8 @@
+# Laufzeitdaten — enthalten echte Identitäten, Tenant-Domains, Subscription-Namen
+# und lokale Pfade. Gehören niemals in einen Commit.
+state.json
+reports/
+
+# macOS
+.DS_Store
+Icon?
