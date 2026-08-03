@@ -2,8 +2,8 @@
 """Azure/MS token health check — reads local az CLI cache + live az probes.
 
 Checks both the global ~/.azure cache and any per-project isolated contexts
-under ~/.azure-contexts/<projekt> (see dernerl/claude-config
-docs/azure-token-isolation.md for the AZURE_CONFIG_DIR pattern).
+under ~/.azure-contexts/<project> — the AZURE_CONFIG_DIR pattern that gives
+each project its own token cache instead of sharing the global one.
 
 Never reads token secrets themselves, only account/tenant metadata and
 whether a live `az` call resolves. Writes state.json (machine-readable)
@@ -18,7 +18,7 @@ from pathlib import Path
 AZURE_DIR = Path.home() / ".azure"
 CONTEXTS_DIR = Path.home() / ".azure-contexts"
 EXTENSION_DIR = AZURE_DIR / "cliextensions"
-PROJECT_SEARCH_ROOTS = [Path.home() / "projects", Path.home() / "Desktop", Path.home() / "Desktop" / "YOLO-WORKBENCH"]
+DEFAULT_PROJECT_SEARCH_ROOTS = [Path.home() / "projects"]
 HERE = Path(__file__).resolve().parent
 STATE_PATH = HERE / "state.json"
 REPORT_PATH = HERE / "reports" / "latest.md"
@@ -40,11 +40,11 @@ def run_az(args, timeout=5, config_dir: Path | None = None):
             return None, (proc.stderr or "").strip().splitlines()[-1:] or ["az failed"]
         return json.loads(proc.stdout or "null"), None
     except FileNotFoundError:
-        return None, ["az CLI nicht gefunden"]
+        return None, ["az CLI not found"]
     except subprocess.TimeoutExpired:
-        return None, ["az CLI Timeout"]
+        return None, ["az CLI timed out"]
     except json.JSONDecodeError:
-        return None, ["az CLI lieferte kein gültiges JSON"]
+        return None, ["az CLI returned invalid JSON"]
 
 
 def load_json(path):
@@ -154,9 +154,23 @@ def discover_contexts():
     return sorted(p for p in CONTEXTS_DIR.iterdir() if p.is_dir())
 
 
+def project_search_roots():
+    """Directories whose immediate subdirectories are projects.
+
+    Override via AZURE_WATCHDOG_PROJECT_ROOTS, a list separated by the
+    platform path separator (e.g. "~/projects:~/work"). Purely cosmetic —
+    it lets a context be labelled with the project that owns it; context
+    discovery itself does not depend on it.
+    """
+    raw = os.environ.get("AZURE_WATCHDOG_PROJECT_ROOTS", "").strip()
+    if not raw:
+        return DEFAULT_PROJECT_SEARCH_ROOTS
+    return [Path(p).expanduser() for p in raw.split(os.pathsep) if p.strip()]
+
+
 def find_project_root(context_dir: Path):
     target = str(context_dir)
-    for root in PROJECT_SEARCH_ROOTS:
+    for root in project_search_roots():
         if not root.is_dir():
             continue
         for settings_file in root.glob("*/.claude/settings.local.json"):
@@ -208,10 +222,10 @@ STATUS_MARK = {
     "no-subscription-context": "⚪",
 }
 STATUS_LABEL = {
-    "dead": "gecachte Subscriptions lösen live nicht mehr auf",
-    "partial": "manche gecachten Subscriptions lösen live nicht mehr auf",
-    "ok": "alle gecachten Subscriptions lösen live auf",
-    "no-subscription-context": "kein Subscription-Kontext gecacht (z. B. Graph-only Login)",
+    "dead": "cached subscriptions no longer resolve live",
+    "partial": "some cached subscriptions no longer resolve live",
+    "ok": "all cached subscriptions resolve live",
+    "no-subscription-context": "no subscription context cached (e.g. Graph-only login)",
 }
 SEVERITY_MARK = {"red": "🔴", "orange": "🟠", "green": "🟢"}
 
@@ -220,38 +234,38 @@ def render_report(state: dict) -> str:
     lines = [f"# Azure/MS Token Watchdog — {state['generated']}", ""]
     ds = state["default_subscription"]
     if state["no_default_set"]:
-        lines.append("**Default Subscription (global ~/.azure):** 🟠 keine gesetzt — `az account set --subscription <name>`")
+        lines.append("**Default subscription (global ~/.azure):** 🟠 none set — `az account set --subscription <name>`")
     elif ds:
-        status = "🔴 TOT (isDefault, aber löst live nicht auf)" if ds["dead"] else "🟢 lebt"
-        lines.append(f"**Default Subscription (global ~/.azure):** {ds['name']} ({ds['user']}) — {status}")
+        status = "🔴 DEAD (isDefault, but does not resolve live)" if ds["dead"] else "🟢 alive"
+        lines.append(f"**Default subscription (global ~/.azure):** {ds['name']} ({ds['user']}) — {status}")
     lines.append("")
-    lines.append(f"**Cache-Drift (global):** {state['cached_subscription_count']} gecacht vs. {state['live_subscription_count']} live "
-                 f"({'Δ ' + str(state['drift']) if state['drift'] else 'keine Differenz'})")
+    lines.append(f"**Cache drift (global):** {state['cached_subscription_count']} cached vs. {state['live_subscription_count']} live "
+                 f"({'Δ ' + str(state['drift']) if state['drift'] else 'no difference'})")
     lines.append("")
     if state["concurrent_az_processes"]:
-        lines.append("**⚠️ Laufende az/azd-Prozesse gerade jetzt:**")
+        lines.append("**⚠️ az/azd processes running right now:**")
         for p in state["concurrent_az_processes"]:
             lines.append(f"- {p}")
         lines.append("")
-    lines.append("## Identitäten im globalen Cache")
+    lines.append("## Identities in the global cache")
     for ident in state["identities"]:
         mark = STATUS_MARK[ident["status"]]
         label = STATUS_LABEL[ident["status"]]
         lines.append(f"- {mark} {ident['username']} — {label}")
     lines.append("")
-    lines.append("## Projekt-Kontexte (isolierte AZURE_CONFIG_DIR)")
+    lines.append("## Project contexts (isolated AZURE_CONFIG_DIR)")
     if not state["contexts"]:
-        lines.append("- (keine gefunden unter `~/.azure-contexts/`)")
+        lines.append("- (none found under `~/.azure-contexts/`)")
     for ctx in state["contexts"]:
         mark = SEVERITY_MARK.get(ctx["severity"], "⚪")
         label = ctx["project_root"] or ctx["name"]
         cds = ctx["default_subscription"]
         if ctx["no_default_set"]:
-            default_info = "keine Default Subscription gesetzt"
+            default_info = "no default subscription set"
         elif cds:
-            default_info = f"Default: {cds['name']} ({'tot' if cds['dead'] else 'lebt'})"
+            default_info = f"default: {cds['name']} ({'dead' if cds['dead'] else 'alive'})"
         else:
-            default_info = "keine Subscriptions gecacht"
+            default_info = "no subscriptions cached"
         lines.append(f"- {mark} {label} — {default_info}")
     return "\n".join(lines) + "\n"
 

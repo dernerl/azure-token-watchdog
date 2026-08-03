@@ -1,7 +1,10 @@
-# Laufzeitdaten — enthalten echte Identitäten, Tenant-Domains, Subscription-Namen
-# und lokale Pfade. Gehören niemals in einen Commit.
+# Runtime data — contains real identities, tenant domains, subscription names
+# and local paths. Must never end up in a commit.
 state.json
 reports/
+
+# Python
+__pycache__/
 
 # macOS
 .DS_Store

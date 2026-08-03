@@ -1,64 +1,78 @@
 # azure-token-watchdog
 
-Prüft, ob der lokale `az`-CLI-Token-Cache noch mit der Realität übereinstimmt —
-bevor ein Skript mitten im Lauf über ein abgelaufenes Token stolpert.
+Checks whether the local `az` CLI token cache still matches reality — before a
+script trips over an expired token halfway through a run.
 
-Das Problem: `~/.azure` cached Subscriptions und Accounts. Läuft ein Refresh-Token
-ab oder wird eine Subscription entzogen, bleibt der Cache trotzdem stehen. `az account list`
-liefert weiter Einträge, die live nicht mehr auflösen. Wer mehrere Identitäten
-parallel nutzt (Kunden-Tenant, Test-Tenant, privat), merkt das erst, wenn ein
-Kommando gegen die falsche oder eine tote Subscription läuft.
+The problem: `~/.azure` caches subscriptions and accounts. When a refresh token
+expires or a subscription is revoked, the cache stays put anyway. `az account list`
+keeps returning entries that no longer resolve live. Anyone juggling several
+identities at once (customer tenant, test tenant, personal) only notices when a
+command runs against the wrong or a dead subscription.
 
-Der Watchdog vergleicht **Cache gegen Live-Antwort** und meldet die Differenz.
+The watchdog compares **cache against live response** and reports the difference.
 
-## Was geprüft wird
+## What gets checked
 
-- **Default-Subscription** — gesetzt? Und löst sie live überhaupt noch auf?
-- **Cache-Drift** — Anzahl gecachter vs. live auflösender Subscriptions
-- **Pro Identität** — lösen alle, manche oder keine ihrer Subscriptions noch auf
-- **Isolierte Projekt-Kontexte** — jedes `~/.azure-contexts/<projekt>` (das
-  `AZURE_CONFIG_DIR`-Muster für getrennte Tenants) wird einzeln geprüft und dem
-  Projekt zugeordnet, das es benutzt
-- **Parallele `az`/`azd`-Prozesse** — laufen gerade welche, besteht Race-Gefahr
-  auf dem gemeinsamen Token-Cache
+- **Default subscription** — is one set? And does it still resolve live at all?
+- **Cache drift** — number of cached vs. live-resolving subscriptions
+- **Per identity** — do all, some, or none of its subscriptions still resolve
+- **Isolated project contexts** — every `~/.azure-contexts/<project>` (the
+  `AZURE_CONFIG_DIR` pattern for separating tenants) is checked individually and
+  mapped to the project that uses it
+- **Concurrent `az`/`azd` processes** — if any are running, there is a race risk
+  on the shared token cache
 
-Daraus wird eine Ampel: `green` / `orange` (Drift, keine Default gesetzt, teilweise
-tot) / `red` (Identität oder Default-Subscription löst nicht mehr auf).
+That rolls up into a traffic light: `green` / `orange` (drift, no default set,
+partially dead) / `red` (an identity or the default subscription no longer resolves).
 
-## Umgang mit Token-Material
+## How token material is handled
 
-Der Watchdog liest `msal_token_cache.json`, greift daraus aber ausschließlich das
-Feld `username` ab (`cached_usernames()`). Tokens, Refresh-Tokens und Secrets
-werden weder gelesen noch geloggt noch geschrieben.
+The watchdog reads `msal_token_cache.json`, but takes nothing from it except the
+`username` field (`cached_usernames()`). Tokens, refresh tokens and secrets are
+never read, never logged, never written.
 
-Die Live-Prüfung nutzt nur lesende Kommandos (`az account list`, `az account show`)
-mit 5s Timeout. Nichts wird verändert — kein `az login`, kein `az account set`.
+The live check uses read-only commands (`az account list`, `az account show`) with
+a 5s timeout. Nothing is modified — no `az login`, no `az account set`.
 
-**Die erzeugten Artefakte sind trotzdem sensibel:** `state.json` und
-`reports/latest.md` enthalten echte Benutzernamen, Tenant-Domains, ggf.
-Subscription-Namen samt `tenantId` und lokale Pfade. Beide sind per `.gitignore`
-ausgeschlossen — das bitte so lassen.
+**The generated artifacts are sensitive regardless:** `state.json` and
+`reports/latest.md` contain real usernames, tenant domains, possibly subscription
+names along with `tenantId`, and local paths. Both are excluded via `.gitignore` —
+please keep it that way.
 
-## Benutzung
+## Usage
 
 ```sh
 python3 token_watchdog.py
 # severity=orange drift=0 contexts=1
 ```
 
-Schreibt zwei Dateien neben das Skript:
+Writes two files next to the script:
 
-- `state.json` — maschinenlesbar, für Weiterverarbeitung
-- `reports/latest.md` — lesbarer Report
+- `state.json` — machine-readable, for further processing
+- `reports/latest.md` — human-readable report
 
-Keine Abhängigkeiten außer Python 3.10+ (`X | None`-Syntax) und der Azure CLI.
+No dependencies beyond Python 3.10+ (`X | None` syntax) and the Azure CLI.
 
-## Menüleiste
+### Configuration
 
-Die SwiftBar-Anzeige liegt bewusst in einem eigenen Repo:
-[dernerl/swiftbar-plugins](https://github.com/dernerl/swiftbar-plugins). Sie liest
-die `state.json` und ist rein optional — dieses Tool läuft eigenständig.
+To map an isolated context to the project using it, the watchdog searches the
+immediate subdirectories of `~/projects` for a `.claude/settings.local.json` whose
+`AZURE_CONFIG_DIR` matches. If your projects live elsewhere, use
+`AZURE_WATCHDOG_PROJECT_ROOTS`:
 
-## Lizenz
+```sh
+AZURE_WATCHDOG_PROJECT_ROOTS="$HOME/work:$HOME/Desktop/WORKBENCH" python3 token_watchdog.py
+```
 
-MIT
+Purely cosmetic — without a match the context is simply reported under its
+directory name. Context discovery itself does not depend on it.
+
+## Menu bar
+
+The SwiftBar display deliberately lives in its own repo:
+[dernerl/swiftbar-plugins](https://github.com/dernerl/swiftbar-plugins). It reads
+`state.json` and is entirely optional — this tool runs on its own.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
