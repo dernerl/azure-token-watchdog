@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
-"""Azure/MS token health check — reads local az CLI cache + live az probes.
+"""Azure/MS token health check — reads local az CLI cache + live token probes.
 
 Checks both the global ~/.azure cache and any per-project isolated contexts
 under ~/.azure-contexts/<project> — the AZURE_CONFIG_DIR pattern that gives
 each project its own token cache instead of sharing the global one.
 
-Never reads token secrets themselves, only account/tenant metadata and
-whether a live `az` call resolves. Writes state.json (machine-readable)
-and reports/latest.md (human-readable).
+Liveness means: can `az account get-access-token` still acquire a token
+(ARM and Graph) for each cached identity/tenant? Only `expiresOn` is
+queried, so token secrets never reach this process' output. Writes
+state.json (machine-readable) and reports/latest.md (human-readable).
 """
 import json
 import os
+import re
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +24,11 @@ DEFAULT_PROJECT_SEARCH_ROOTS = [Path.home() / "projects"]
 HERE = Path(__file__).resolve().parent
 STATE_PATH = HERE / "state.json"
 REPORT_PATH = HERE / "reports" / "latest.md"
+# A probe may trigger a refresh-token round trip, so allow more than the
+# local-only default.
+TOKEN_PROBE_TIMEOUT = 20
+TOKEN_RESOURCES = {"arm": [], "graph": ["--resource-type", "ms-graph"]}
+AADSTS_RE = re.compile(r"AADSTS\d+")
 
 
 def run_az(args, timeout=5, config_dir: Path | None = None):
@@ -37,7 +44,14 @@ def run_az(args, timeout=5, config_dir: Path | None = None):
             capture_output=True, text=True, timeout=timeout, env=env,
         )
         if proc.returncode != 0:
-            return None, (proc.stderr or "").strip().splitlines()[-1:] or ["az failed"]
+            stderr = (proc.stderr or "").strip()
+            # The AADSTS code is the useful part; az often ends with a
+            # generic hint or footer instead, so the last line is useless.
+            code = AADSTS_RE.search(stderr)
+            if code:
+                return None, [code.group(0)]
+            errors = [l for l in stderr.splitlines() if l.startswith("ERROR:")]
+            return None, errors[:1] or stderr.splitlines()[-1:] or ["az failed"]
         return json.loads(proc.stdout or "null"), None
     except FileNotFoundError:
         return None, ["az CLI not found"]
@@ -77,12 +91,30 @@ def concurrent_az_process():
     return lines
 
 
-def severity_for(no_default_set, default_dead, drift, identities, concurrent=None):
+def severity_for(no_default_set, default_dead, identities, concurrent=None):
     if default_dead or any(i["status"] == "dead" for i in identities):
         return "red"
-    if no_default_set or drift > 0 or concurrent or any(i["status"] == "partial" for i in identities):
+    if no_default_set or concurrent or any(i["status"] == "partial" for i in identities):
         return "orange"
     return "green"
+
+
+def probe_tokens(subscription_id: str, config_dir: Path | None):
+    """Try to acquire ARM and Graph tokens as the subscription's identity.
+
+    `--query expiresOn` keeps the token itself out of stdout. Any failure
+    counts as dead — no allowlist of AADSTS codes, the next new one would
+    slip through again.
+    """
+    probes = {}
+    for resource, extra_args in TOKEN_RESOURCES.items():
+        expires_on, err = run_az(
+            ["account", "get-access-token", "--subscription", subscription_id,
+             *extra_args, "--query", "expiresOn"],
+            timeout=TOKEN_PROBE_TIMEOUT, config_dir=config_dir,
+        )
+        probes[resource] = {"ok": err is None, "expires_on": expires_on, "error": err}
+    return probes
 
 
 def resolve_context(config_dir: Path | None):
@@ -92,41 +124,40 @@ def resolve_context(config_dir: Path | None):
     cached_subs = profile.get("subscriptions", [])
     default_sub = next((s for s in cached_subs if s.get("isDefault")), None)
 
-    live_subs, live_list_err = run_az(["account", "list"], config_dir=config_dir)
-    live_subs = live_subs or []
-    live_ids = {s.get("id") for s in live_subs}
-
-    _, live_show_err = run_az(["account", "show"], config_dir=config_dir)
+    # One probe per (user, tenant): tokens are issued per identity and
+    # tenant, not per subscription. Prefer the default subscription so its
+    # pair is probed through it.
+    representatives = {}
+    for s in sorted(cached_subs, key=lambda s: not s.get("isDefault")):
+        key = (s.get("user", {}).get("name", "?"), s.get("tenantId"))
+        representatives.setdefault(key, s["id"])
+    probes = {key: probe_tokens(sub_id, config_dir) for key, sub_id in representatives.items()}
 
     no_default_set = default_sub is None
-    default_dead = False
+    default_probe = None
     if default_sub is not None:
-        default_dead = (default_sub["id"] not in live_ids) or bool(live_show_err)
-
-    drift = len(cached_subs) - len(live_subs)
+        default_probe = probes[(default_sub.get("user", {}).get("name", "?"), default_sub.get("tenantId"))]["arm"]
 
     # Per-user rollup: only users with cached subscriptions can be scored
     # (an MSAL account with zero subscriptions is normal for Graph-only
-    # logins and cannot be assessed without a side-effecting live call).
-    by_user = {}
-    for s in cached_subs:
-        user = s.get("user", {}).get("name", "?")
-        by_user.setdefault(user, {"cached": 0, "live": 0})
-        by_user[user]["cached"] += 1
-        if s.get("id") in live_ids:
-            by_user[user]["live"] += 1
-
+    # logins; `get-access-token --tenant` would probe the active account,
+    # not necessarily this one).
     identities = []
     for username in cached_usernames(base):
-        counts = by_user.get(username)
-        if counts is None:
+        tenants = [
+            {"tenant": tenant, **tenant_probes}
+            for (user, tenant), tenant_probes in probes.items() if user == username
+        ]
+        if not tenants:
             identities.append({"username": username, "status": "no-subscription-context"})
-        elif counts["live"] == 0:
-            identities.append({"username": username, "status": "dead", "cached": counts["cached"]})
-        elif counts["live"] < counts["cached"]:
-            identities.append({"username": username, "status": "partial", "cached": counts["cached"], "live": counts["live"]})
+            continue
+        if not any(t["arm"]["ok"] for t in tenants):
+            status = "dead"
+        elif all(t[r]["ok"] for t in tenants for r in TOKEN_RESOURCES):
+            status = "ok"
         else:
-            identities.append({"username": username, "status": "ok", "cached": counts["cached"]})
+            status = "partial"
+        identities.append({"username": username, "status": status, "tenants": tenants})
 
     return {
         "no_default_set": no_default_set,
@@ -135,16 +166,13 @@ def resolve_context(config_dir: Path | None):
                 "name": default_sub.get("name"),
                 "user": default_sub.get("user", {}).get("name"),
                 "tenant": default_sub.get("tenantId"),
-                "dead": default_dead,
+                "dead": not default_probe["ok"],
+                "expires_on": default_probe["expires_on"],
+                "error": default_probe["error"],
             }
             if default_sub else None
         ),
         "identities": identities,
-        "cached_subscription_count": len(cached_subs),
-        "live_subscription_count": len(live_subs),
-        "drift": drift,
-        "live_list_error": live_list_err,
-        "live_show_error": live_show_err,
     }
 
 
@@ -185,7 +213,7 @@ def check():
     concurrent = concurrent_az_process()
     global_severity = severity_for(
         global_result["no_default_set"], global_result["default_subscription"] and global_result["default_subscription"]["dead"],
-        global_result["drift"], global_result["identities"], concurrent,
+        global_result["identities"], concurrent,
     )
 
     contexts = []
@@ -194,7 +222,7 @@ def check():
         result = resolve_context(ctx_dir)
         ctx_severity = severity_for(
             result["no_default_set"], result["default_subscription"] and result["default_subscription"]["dead"],
-            result["drift"], result["identities"],
+            result["identities"],
         )
         contexts.append({
             "name": ctx_dir.name,
@@ -222,12 +250,20 @@ STATUS_MARK = {
     "no-subscription-context": "⚪",
 }
 STATUS_LABEL = {
-    "dead": "cached subscriptions no longer resolve live",
-    "partial": "some cached subscriptions no longer resolve live",
-    "ok": "all cached subscriptions resolve live",
+    "dead": "no ARM token can be acquired in any tenant",
+    "partial": "some ARM/Graph tokens can no longer be acquired",
+    "ok": "ARM and Graph tokens acquired in all tenants",
     "no-subscription-context": "no subscription context cached (e.g. Graph-only login)",
 }
 SEVERITY_MARK = {"red": "🔴", "orange": "🟠", "green": "🟢"}
+
+
+def probe_failures(ident: dict) -> list[str]:
+    return [
+        f"  - {t['tenant']} {resource.upper()}: {', '.join(t[resource]['error'])}"
+        for t in ident.get("tenants", []) for resource in TOKEN_RESOURCES
+        if not t[resource]["ok"]
+    ]
 
 
 def render_report(state: dict) -> str:
@@ -236,11 +272,9 @@ def render_report(state: dict) -> str:
     if state["no_default_set"]:
         lines.append("**Default subscription (global ~/.azure):** 🟠 none set — `az account set --subscription <name>`")
     elif ds:
-        status = "🔴 DEAD (isDefault, but does not resolve live)" if ds["dead"] else "🟢 alive"
+        status = (f"🔴 DEAD (no ARM token: {', '.join(ds['error'])})" if ds["dead"]
+                  else f"🟢 alive (ARM token until {ds['expires_on']})")
         lines.append(f"**Default subscription (global ~/.azure):** {ds['name']} ({ds['user']}) — {status}")
-    lines.append("")
-    lines.append(f"**Cache drift (global):** {state['cached_subscription_count']} cached vs. {state['live_subscription_count']} live "
-                 f"({'Δ ' + str(state['drift']) if state['drift'] else 'no difference'})")
     lines.append("")
     if state["concurrent_az_processes"]:
         lines.append("**⚠️ az/azd processes running right now:**")
@@ -252,6 +286,7 @@ def render_report(state: dict) -> str:
         mark = STATUS_MARK[ident["status"]]
         label = STATUS_LABEL[ident["status"]]
         lines.append(f"- {mark} {ident['username']} — {label}")
+        lines.extend(probe_failures(ident))
     lines.append("")
     lines.append("## Project contexts (isolated AZURE_CONFIG_DIR)")
     if not state["contexts"]:
@@ -263,7 +298,7 @@ def render_report(state: dict) -> str:
         if ctx["no_default_set"]:
             default_info = "no default subscription set"
         elif cds:
-            default_info = f"default: {cds['name']} ({'dead' if cds['dead'] else 'alive'})"
+            default_info = f"default: {cds['name']} ({'dead: ' + ', '.join(cds['error']) if cds['dead'] else 'alive'})"
         else:
             default_info = "no subscriptions cached"
         lines.append(f"- {mark} {label} — {default_info}")
@@ -275,7 +310,7 @@ def main():
     STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
     REPORT_PATH.parent.mkdir(exist_ok=True)
     REPORT_PATH.write_text(render_report(state), encoding="utf-8")
-    print(f"severity={state['severity']} drift={state['drift']} contexts={len(state['contexts'])}")
+    print(f"severity={state['severity']} contexts={len(state['contexts'])}")
 
 
 if __name__ == "__main__":
