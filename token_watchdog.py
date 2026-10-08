@@ -273,7 +273,7 @@ def render_report(state: dict) -> str:
         lines.append("**Default subscription (global ~/.azure):** 🟠 none set — `az account set --subscription <name>`")
     elif ds:
         status = (f"🔴 DEAD (no ARM token: {', '.join(ds['error'])})" if ds["dead"]
-                  else f"🟢 alive (ARM token until {ds['expires_on']})")
+                  else "🟢 alive")
         lines.append(f"**Default subscription (global ~/.azure):** {ds['name']} ({ds['user']}) — {status}")
     lines.append("")
     if state["concurrent_az_processes"]:
